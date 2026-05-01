@@ -1,13 +1,13 @@
 
 
 """
-mafia_server.py — 브레드 킬러 서버 v8.4
+mafia_server.py - 브레드 킬러 서버 v8.4
 [수정]
-  1. AI 틱레이트 0.5 → 0.05 (초당 20틱, 더 부드러운 이동)
-  2. AI 마피아 코사인 무빙 — 지그재그 사인파 횡이동으로 타깃 추격
-  3. 페이즈 사이클: meet → night → morning → day → dusk(저녁20초) → night → ...
+  1. AI 틱레이트 0.5 -> 0.05 (초당 20틱, 더 부드러운 이동)
+  2. AI 마피아 코사인 무빙 - 지그재그 사인파 횡이동으로 타깃 추격
+  3. 페이즈 사이클: meet -> night -> morning -> day -> dusk(저녁20초) -> night -> ...
      dusk 페이즈 20초 추가
-  4. 집 실내 조명 — 밤에 꺼짐, 광장 포인트 라이트만 켜짐
+  4. 집 실내 조명 - 밤에 꺼짐, 광장 포인트 라이트만 켜짐
   5. baguette_hit 서버권위 유지
 """
 import asyncio, json, os, random, time, math
@@ -33,9 +33,8 @@ PHASE_TIMES = {
     "night":   120,
     "morning": 15,
     "day":     180,
-    "dusk":    20,   # ★ 저녁 20초
+    "dusk":    20,
 }
-# ★ 페이즈 사이클: 만남 → 밤 → 아침 → 낮 → 저녁 → 밤 → ...
 PHASE_CYCLE = ["night", "morning", "day", "dusk"]
 MAX_ROUNDS  = 10
 SESSION_TTL = 3600
@@ -44,7 +43,6 @@ POSITION_SYNC_INTERVAL = 0.1
 DOORLOCK_HACK_DURATION = 15.0
 DOORLOCK_SUCCESS_RATE  = 0.67
 
-# ★ 바게트 설정
 BAGUETTE_RANGE         = 2.5
 BAGUETTE_HIT_COOLDOWN  = 0.8
 BAGUETTE_HITS_TO_KILL  = 2
@@ -56,15 +54,14 @@ BATTERY_DURATION_SEC   = 60.0
 POTION_PRICE           = 700
 POTION_DURATION        = 20.0
 
-AI_IDLE_CHANCE       = 0.05   # ★ 아이들 확률 낮춤 (더 활발하게)
+AI_IDLE_CHANCE       = 0.05
 AI_MOVE_SPEED        = 3.5
-AI_MOVE_UPDATE_RATE  = 0.05   # ★ 0.5 → 0.05 (초당 20틱, 훨씬 부드러움)
+AI_MOVE_UPDATE_RATE  = 0.05
 AI_ACTION_DELAY_MIN  = 3
 AI_ACTION_DELAY_MAX  = 10
 
-# ★ AI 코사인 무빙 설정
-AI_COSINE_AMPLITUDE  = 1.8    # 사인파 횡이동 진폭 (단위: 월드 좌표)
-AI_COSINE_FREQUENCY  = 0.9    # 사인파 주파수 (Hz 느낌)
+AI_COSINE_AMPLITUDE  = 1.8
+AI_COSINE_FREQUENCY  = 0.9
 
 LOD_NEAR_DIST = 20.0
 
@@ -95,9 +92,6 @@ ai_move_targets:  dict = {}
 baguette_hits:    dict = {}
 
 
-# ================================================================
-# HTTP 헬퍼
-# ================================================================
 async def _http_get(url):
     try:
         if _USE_HTTPX and _http_client:
@@ -141,9 +135,6 @@ async def rtdb_get(path):      return await _http_get(_rtdb(path))
 async def rtdb_patch(path, d): return await _http_patch(_rtdb(path), d)
 
 
-# ================================================================
-# Redis / 인메모리
-# ================================================================
 def _redis_headers():
     return {"Authorization": f"Bearer {REDIS_TOKEN}", "Content-Type": "application/json"}
 
@@ -187,9 +178,6 @@ async def load_gs(rc): return (await redis_get(_gs_key(rc))) or {}
 async def save_gs(rc, gs): await redis_set(_gs_key(rc), gs)
 
 
-# ================================================================
-# 역할 계산
-# ================================================================
 def calc_roles(total):
     c = {"mafia": 0, "police": 0, "doctor": 0, "citizen": 0}
     if total <= 3:
@@ -205,9 +193,6 @@ def calc_roles(total):
     return c
 
 
-# ================================================================
-# AI 충돌 방지 유틸
-# ================================================================
 def _clamp_to_world(x: float, z: float) -> tuple:
     x = max(-WORLD_BOUND, min(WORLD_BOUND, x))
     z = max(-WORLD_BOUND, min(WORLD_BOUND, z))
@@ -255,9 +240,6 @@ def _safe_target(tx, tz):
     return tx, tz
 
 
-# ================================================================
-# 브로드캐스트
-# ================================================================
 async def broadcast(room_code, msg, exclude=None):
     if room_code not in sessions: return
     data = json.dumps(msg, ensure_ascii=False)
@@ -274,9 +256,6 @@ async def send_to(room_code, uid, msg):
     except: pass
 
 
-# ================================================================
-# 바게트 히트 카운트 처리 (서버권위)
-# ================================================================
 def _get_hit_state(room_code: str, killer: str, target: str) -> dict:
     baguette_hits.setdefault(room_code, {})
     baguette_hits[room_code].setdefault(killer, {})
@@ -341,7 +320,7 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str,
     hs["last_hit"]  = now
 
     hit_count = hs["count"]
-    print(f"[Baguette] {killer_uid} → {target_uid} | {hit_count}/{BAGUETTE_HITS_TO_KILL}타", flush=True)
+    print(f"[Baguette] {killer_uid} -> {target_uid} | {hit_count}/{BAGUETTE_HITS_TO_KILL}타", flush=True)
 
     await send_to(room_code, target_uid, {
         "t":    "baguette_hit_received",
@@ -361,7 +340,7 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str,
             "pos_x":  tp.get("x", 0),
             "pos_z":  tp.get("z", 0),
         })
-        print(f"[Baguette] 킬 확정: {killer_uid} → {target_uid}", flush=True)
+        print(f"[Baguette] 킬 확정: {killer_uid} -> {target_uid}", flush=True)
 
         winner = check_win(gs)
         if winner:
@@ -377,9 +356,6 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str,
     return False
 
 
-# ================================================================
-# LOD 위치 동기화 루프
-# ================================================================
 async def position_sync_loop(room_code):
     slow_tick = 0
     try:
@@ -435,13 +411,8 @@ async def position_sync_loop(room_code):
         print(f"[PosSync] 오류: {e}", flush=True)
 
 
-# ================================================================
-# ★ AI 서버권위 이동 루프 — 틱레이트 0.05초(초당 20틱)
-# ================================================================
 async def ai_move_loop(room_code):
     print(f"[AiMove] {room_code} 시작 (틱레이트: {AI_MOVE_UPDATE_RATE}s)", flush=True)
-    # ai_uid → { target_x, target_z, timer, chase_uid, stuck_count,
-    #            cosine_phase, cosine_travel_dist }
     ai_local: dict = {}
 
     try:
@@ -476,7 +447,6 @@ async def ai_move_loop(room_code):
                         "target_x": 0, "target_z": 0, "timer": 0,
                         "chase_uid": "", "spy_house_x": 0, "spy_house_z": 0,
                         "protect_uid": "", "stuck_count": 0,
-                        # ★ 코사인 무빙용
                         "cosine_phase": random.uniform(0, math.pi * 2),
                         "cosine_travel": 0.0,
                     }
@@ -491,7 +461,6 @@ async def ai_move_loop(room_code):
                 cx   = cur.get("x", 0.0)
                 cz   = cur.get("z", 0.0)
 
-                # ── 마피아 야간 코사인 무빙 ──────────────────────
                 if role == "mafia" and phase == "night":
                     anim, cx, cz = _ai_mafia_cosine_move(
                         ai_uid, cx, cz,
@@ -509,7 +478,6 @@ async def ai_move_loop(room_code):
                     }
                     continue
 
-                # ── 그 외 역할 일반 이동 ────────────────────────
                 raw_tx, raw_tz = _ai_role_target(
                     ai_uid, role, phase,
                     alive, roles, house_asgn,
@@ -560,13 +528,8 @@ async def ai_move_loop(room_code):
     print(f"[AiMove] {room_code} 종료", flush=True)
 
 
-# ================================================================
-# ★ AI 마피아 코사인(사인파) 무빙
-#   타깃을 향해 이동하면서 진행 방향의 수직으로 sin파 횡이동 적용
-# ================================================================
 async def _do_ai_baguette_hit(room_code: str, ai_uid: str, target_uid: str,
                                cx: float, cz: float, gs: dict, st: dict):
-    """AI 바게트 히트 처리 — process_baguette_hit과 동일한 서버권위 로직"""
     now      = time.time()
     last_atk = attack_cooldowns.get(room_code, {}).get(ai_uid, 0)
     if now - last_atk < BAGUETTE_HIT_COOLDOWN:
@@ -578,7 +541,7 @@ async def _do_ai_baguette_hit(room_code: str, ai_uid: str, target_uid: str,
         hs["count"] = 0
     hs["count"]  += 1
     hs["last_hit"] = now
-    print(f"[AI-Hit] {ai_uid}→{target_uid} {hs['count']}/{BAGUETTE_HITS_TO_KILL}", flush=True)
+    print(f"[AI-Hit] {ai_uid}->{target_uid} {hs['count']}/{BAGUETTE_HITS_TO_KILL}", flush=True)
 
     if hs["count"] >= BAGUETTE_HITS_TO_KILL:
         _reset_hit_state(room_code, ai_uid, target_uid)
@@ -592,7 +555,7 @@ async def _do_ai_baguette_hit(room_code: str, ai_uid: str, target_uid: str,
             "victim": target_uid,
             "pos_x":  tp.get("x", cx), "pos_z": tp.get("z", cz),
         })
-        print(f"[AI-킬] {ai_uid} → {target_uid}", flush=True)
+        print(f"[AI-킬] {ai_uid} -> {target_uid}", flush=True)
         winner = check_win(gs)
         if winner:
             await end_game(room_code, gs, winner, "baguette")
@@ -604,14 +567,6 @@ async def _do_ai_baguette_hit(room_code: str, ai_uid: str, target_uid: str,
 def _ai_mafia_cosine_move(ai_uid, cx, cz,
                            alive, roles, house_asgn,
                            pos_store, dl_store, room_code, gs, st):
-    """
-    마피아 AI 코사인(사인파) 무빙.
-    1) chase_uid 설정
-    2) 타깃까지 방향벡터 계산
-    3) 수직 방향에 sin파 오프셋 적용 → 지그재그 무빙
-    4) 근접 시 baguette 공격 (비동기 태스크)
-    """
-    # ── 타깃 선택 ────────────────────────────────────────────
     alive_others = [u for u, a in alive.items() if a and u != ai_uid]
     if not st.get("chase_uid") or not alive.get(st.get("chase_uid", "")):
         cands = [u for u in alive_others if roles.get(u) != "mafia"]
@@ -621,7 +576,6 @@ def _ai_mafia_cosine_move(ai_uid, cx, cz,
     step = AI_MOVE_SPEED * AI_MOVE_UPDATE_RATE
 
     if not target_uid:
-        # 타깃 없으면 광장 근처 배회
         if st["timer"] <= 0:
             angle = random.uniform(0, math.pi * 2)
             r     = random.uniform(2, 7)
@@ -632,12 +586,10 @@ def _ai_mafia_cosine_move(ai_uid, cx, cz,
         cx, cz = _safe_move(cx, cz, tx, tz, step)
         return "walk", cx, cz
 
-    # ── 타깃 위치 ─────────────────────────────────────────────
     tp   = pos_store.get(target_uid, {})
     raw_tx = float(tp.get("x", 0))
     raw_tz = float(tp.get("z", 0))
 
-    # 잠긴 집 앞에서 대기
     hid   = house_asgn.get(target_uid, "")
     house = dl_store.get(hid, {})
     locked = house.get("is_locked", False) and not house.get("hack_success", False)
@@ -652,36 +604,29 @@ def _ai_mafia_cosine_move(ai_uid, cx, cz,
     dz   = raw_tz - cz
     dist = math.sqrt(dx*dx + dz*dz)
 
-    # ── 근접 시 공격 (asyncio task) ──────────────────────────
     if dist < BAGUETTE_RANGE and not locked:
         asyncio.create_task(
             _do_ai_baguette_hit(room_code, ai_uid, target_uid, cx, cz, gs, st)
         )
         return "idle", cx, cz
 
-    # ── 코사인 무빙 계산 ──────────────────────────────────────
-    #  진행 방향 단위벡터
     if dist > 0.01:
         fwd_x = dx / dist
         fwd_z = dz / dist
     else:
         fwd_x, fwd_z = 1.0, 0.0
 
-    # 진행방향에 수직인 벡터 (2D에서 90도 회전)
     perp_x = -fwd_z
     perp_z =  fwd_x
 
-    # 이동 누적 거리 갱신 → 사인파 위상으로 사용
     st["cosine_travel"] = st.get("cosine_travel", 0.0) + step
     phase_val = st["cosine_travel"] * AI_COSINE_FREQUENCY + st.get("cosine_phase", 0.0)
     sin_offset = math.sin(phase_val) * AI_COSINE_AMPLITUDE
 
-    # 목표 위치 = 원래 목표 + 횡이동 오프셋
     offset_tx = raw_tx + perp_x * sin_offset
     offset_tz = raw_tz + perp_z * sin_offset
     tx, tz = _safe_target(offset_tx, offset_tz)
 
-    # 이동
     prev_cx, prev_cz = cx, cz
     cx, cz = _safe_move(cx, cz, tx, tz, step)
 
@@ -706,8 +651,6 @@ def _ai_role_target(ai_uid, role, phase, alive, roles, house_asgn,
     alive_others = [u for u, a in alive.items() if a and u != ai_uid]
 
     if role == "mafia":
-        # 야간 마피아는 _ai_mafia_cosine_move에서 별도 처리됨
-        # 낮/기타 페이즈
         a = random.uniform(0, math.pi*2); r = random.uniform(2, 6)
         return math.cos(a)*r, math.sin(a)*r
 
@@ -748,9 +691,6 @@ def _ai_role_target(ai_uid, role, phase, alive, roles, house_asgn,
         return math.cos(a)*r, math.sin(a)*r
 
 
-# ================================================================
-# 도어락
-# ================================================================
 def init_doorlocks(room_code, gs):
     uids  = list(gs["players"].keys())
     total = len(uids)
@@ -801,9 +741,6 @@ def unlock_all_doors(rc):
         h["hack_success"]     = False
 
 
-# ================================================================
-# 경제
-# ================================================================
 def give_morning_bread(gs):
     if "economy" not in gs:
         gs["economy"] = {}
@@ -818,9 +755,6 @@ def get_economy(gs, uid):
     return gs.get("economy", {}).get(uid, {"bread": 0, "batteries": 1, "potions": 0, "flashlight_on": False})
 
 
-# ================================================================
-# 밤 행동 처리
-# ================================================================
 async def process_night(room_code, gs):
     roles = gs["roles"]
     alive = gs["alive"]
@@ -869,9 +803,6 @@ async def process_night(room_code, gs):
     return mr
 
 
-# ================================================================
-# 낮 투표 처리
-# ================================================================
 async def process_votes(room_code, gs):
     alive_list = [u for u, a in gs["alive"].items() if a]
     votes  = gs["day_votes"]
@@ -918,9 +849,6 @@ def check_win(gs):
     return None
 
 
-# ================================================================
-# AI 자동 행동
-# ================================================================
 async def ai_do_night_actions(room_code):
     gs = await load_gs(room_code)
     if not gs or gs.get("phase") != "night": return
@@ -983,9 +911,6 @@ async def ai_do_vote_actions(room_code):
     await asyncio.gather(*[_vote(uid) for uid in ai_uids], return_exceptions=True)
 
 
-# ================================================================
-# 세션 초기화
-# ================================================================
 async def init_session(room_code, room_data):
     pdata    = room_data.get("players", {})
     host_uid = room_data.get("hostId", "")
@@ -1057,15 +982,11 @@ async def init_session(room_code, room_data):
     return gs
 
 
-# ================================================================
-# ★ 페이즈 루프 — 저녁(dusk) 포함
-# ================================================================
 async def phase_loop(room_code):
     print(f"[Phase] {room_code} 루프 시작", flush=True)
     try:
         gs = await load_gs(room_code)
 
-        # ★ 만남 → 밤 → 아침 → 낮 → 저녁 → 밤 → ... 사이클
         phase_queue = ["meet"] + PHASE_CYCLE * (MAX_ROUNDS + 2)
 
         for phase in phase_queue:
@@ -1076,16 +997,14 @@ async def phase_loop(room_code):
             await save_gs(room_code, gs)
             wait = PHASE_TIMES.get(phase, 60)
 
-            # ── 페이즈별 특별 처리 ───────────────────────────
             if phase == "night":
                 _reset_all_hits_for_room(room_code)
                 lock_all_doors(room_code)
-                # ★ 밤 시작: 집 조명 OFF, 광장 조명 ON 신호 전송
                 await broadcast(room_code, {
                     "t":   "lighting_change",
                     "phase": "night",
-                    "house_lights": False,   # 집 내부 조명 OFF
-                    "plaza_lights": True,    # 광장 조명 ON
+                    "house_lights": False,
+                    "plaza_lights": True,
                     "street_lights_energy": 3.5,
                 })
                 await broadcast(room_code, {"t": "doorlock_all_locked", "msg": "모든 집이 잠깁니다."})
@@ -1097,7 +1016,6 @@ async def phase_loop(room_code):
                 gs = give_morning_bread(gs)
                 await save_gs(room_code, gs)
 
-                # ★ 아침: 집 조명 OFF (낮이므로 필요없음), 거리 조명 낮춤
                 await broadcast(room_code, {
                     "t":   "lighting_change",
                     "phase": "morning",
@@ -1139,7 +1057,6 @@ async def phase_loop(room_code):
 
             elif phase == "meet":
                 await _send_house_hints(room_code, gs)
-                # 낮 조명
                 await broadcast(room_code, {
                     "t":   "lighting_change",
                     "phase": "meet",
@@ -1149,7 +1066,6 @@ async def phase_loop(room_code):
                 })
 
             elif phase == "day":
-                # ★ 낮: 집 조명 OFF
                 await broadcast(room_code, {
                     "t":   "lighting_change",
                     "phase": "day",
@@ -1159,11 +1075,10 @@ async def phase_loop(room_code):
                 })
 
             elif phase == "dusk":
-                # ★ 저녁: 서서히 어두워짐, 집 조명 아직 OFF
                 await broadcast(room_code, {
                     "t":   "lighting_change",
                     "phase": "dusk",
-                    "house_lights": False,   # 집 조명은 밤에만 ON
+                    "house_lights": False,
                     "plaza_lights": True,
                     "street_lights_energy": 1.5,
                 })
@@ -1269,9 +1184,6 @@ async def _cleanup(room_code, delay=60):
         print(f"[Cleanup] {room_code} 삭제", flush=True)
 
 
-# ================================================================
-# 유틸
-# ================================================================
 def _should_start(room_code, gs):
     s = sessions.get(room_code)
     if not s or s["status"] != "waiting": return False
@@ -1297,9 +1209,6 @@ def _ensure_loop(room_code):
     _start_loops(room_code); return True
 
 
-# ================================================================
-# lifespan + app
-# ================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client
@@ -1313,9 +1222,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ================================================================
-# HTTP 엔드포인트
-# ================================================================
 @app.post("/room/start")
 async def http_start(request: Request):
     try: body = await request.json()
@@ -1354,9 +1260,6 @@ async def http_state(room_code: str):
     })
 
 
-# ================================================================
-# WebSocket
-# ================================================================
 @app.websocket("/ws/mafia")
 async def ws_mafia(ws: WebSocket):
     await ws.accept()
