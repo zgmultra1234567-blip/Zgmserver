@@ -1,11 +1,11 @@
 """
-mafia_server.py - 브레드 킬러 서버 v8.5
-[v8.5 수정사항]
-  1. player_joined broadcast에 player_data 포함 → 방 입장자도 다른 플레이어 스폰 가능
-  2. "join" 핸들러: 게임 중(playing)이어도 세션에 등록 + joined 전송 (방 입장자 재연결 지원)
-  3. init_session에서 old_ws 복구 강화 — sessions에 없어도 Firebase players 기반으로 세팅
-  4. 서버 초기 플레이어 위치 y=0.0 유지 (클라이언트 CharacterBody3D 기준)
-  5. phase_loop 시작 전 모든 연결된 플레이어에게 현재 상태 재전송 (joined 재전송)
+mafia_server.py — 브레드 킬러 서버 v8.6
+[v8.6 수정사항]
+  1. AI_MOVE_UPDATE_RATE = 1/15 ≈ 0.0667 (15Hz 틱레이트)
+  2. POSITION_SYNC_INTERVAL = 1/15 ≈ 0.0667 (위치 동기화도 15Hz)
+  3. pos_sync 페이로드에 velocity 힌트(vx, vz) 추가 → 클라이언트 데드 레코닝 지원
+  4. AI 위치에 prev 값 저장 → velocity 계산용
+  5. 나머지 게임 로직은 v8.5 그대로 유지
 """
 import asyncio, json, os, random, time, math
 from contextlib import asynccontextmanager
@@ -36,7 +36,11 @@ PHASE_CYCLE = ["night", "morning", "day", "dusk"]
 MAX_ROUNDS  = 10
 SESSION_TTL = 3600
 
-POSITION_SYNC_INTERVAL = 0.1
+# ★ v8.6 핵심: 15Hz 틱레이트
+TICK_RATE              = 1.0 / 15.0          # ≈ 0.0667s
+POSITION_SYNC_INTERVAL = TICK_RATE           # 위치 동기화 주기
+AI_MOVE_UPDATE_RATE    = TICK_RATE           # AI 이동 계산 주기
+
 DOORLOCK_HACK_DURATION = 15.0
 DOORLOCK_SUCCESS_RATE  = 0.67
 
@@ -53,7 +57,6 @@ POTION_DURATION        = 20.0
 
 AI_IDLE_CHANCE       = 0.05
 AI_MOVE_SPEED        = 3.5
-AI_MOVE_UPDATE_RATE  = 0.05
 AI_ACTION_DELAY_MIN  = 3
 AI_ACTION_DELAY_MAX  = 10
 
@@ -77,20 +80,19 @@ for _v in [(-28,-14),(28,-14),(-28,14),(28,14),(-14,-28),(14,-28),(-14,28),(14,2
 HOUSE_HALF    = 2.8
 DOOR_OFFSET_Z = 2.52
 
-print(f"=== 브레드 킬러 서버 v8.5 | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
+print(f"=== 브레드 킬러 서버 v8.6 | 틱={TICK_RATE*1000:.1f}ms(15Hz) | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
 sessions:         dict = {}
 _mem_store:       dict = {}
 _http_client           = None
 player_positions: dict = {}
+# ★ v8.6: AI 이전 위치 저장용 (velocity 계산)
+player_prev_positions: dict = {}
 doorlock_states:  dict = {}
 attack_cooldowns: dict = {}
 ai_move_targets:  dict = {}
 baguette_hits:    dict = {}
-
-# ★ 추가: pre_connections — join 메시지 전에 WS 연결만 된 클라이언트 임시 저장
-# { room_code: { uid: ws } }  (join 핸들러에서 sessions["players"]로 이동)
-pre_connections: dict = {}
+pre_connections:  dict = {}
 
 
 async def _http_get(url):
@@ -331,7 +333,22 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str,
     return False
 
 
+# ★ v8.6: velocity 계산 헬퍼
+def _calc_velocity(room_code: str, uid: str, cur: dict) -> tuple:
+    """이전 프레임 대비 velocity(units/sec) 반환"""
+    prev = player_prev_positions.get(room_code, {}).get(uid)
+    if not prev:
+        return 0.0, 0.0
+    dt = TICK_RATE  # 틱레이트가 일정하므로 상수 사용
+    if dt <= 0:
+        return 0.0, 0.0
+    vx = (cur.get("x", 0) - prev.get("x", 0)) / dt
+    vz = (cur.get("z", 0) - prev.get("z", 0)) / dt
+    return round(vx, 3), round(vz, 3)
+
+
 async def position_sync_loop(room_code):
+    """★ v8.6: 15Hz 동기화 + velocity 힌트 포함"""
     slow_tick = 0
     try:
         while room_code in sessions and sessions[room_code]["status"] == "playing":
@@ -339,17 +356,23 @@ async def position_sync_loop(room_code):
             pos = player_positions.get(room_code, {})
             if not pos: continue
             slow_tick += 1
+            # 5틱마다(~333ms) 원거리 플레이어도 포함
             send_slow = (slow_tick % 5 == 0)
             sess = sessions.get(room_code, {})
+
             for uid, pinfo in list(sess.get("players", {}).items()):
                 if pinfo.get("isAI"): continue
                 my_pos = pos.get(uid)
                 if not my_pos:
                     try:
+                        # velocity 포함 전체 전송
+                        pos_with_vel = _build_pos_with_vel(room_code, pos)
                         await pinfo["ws"].send_text(
-                            json.dumps({"t": "pos_sync", "positions": pos, "ts": int(time.time()*1000)}, ensure_ascii=False))
+                            json.dumps({"t": "pos_sync", "positions": pos_with_vel,
+                                        "ts": int(time.time()*1000)}, ensure_ascii=False))
                     except: pass
                     continue
+
                 mx, mz = my_pos.get("x", 0), my_pos.get("z", 0)
                 near_pos = {}; far_pos = {}
                 for other_uid, other_p in pos.items():
@@ -357,22 +380,41 @@ async def position_sync_loop(room_code):
                     dx   = other_p.get("x", 0) - mx
                     dz   = other_p.get("z", 0) - mz
                     dist = math.sqrt(dx*dx + dz*dz)
-                    if dist <= LOD_NEAR_DIST: near_pos[other_uid] = other_p
-                    else:                    far_pos[other_uid]  = other_p
+                    # velocity 힌트 추가
+                    vx, vz = _calc_velocity(room_code, other_uid, other_p)
+                    entry = dict(other_p)
+                    entry["vx"] = vx; entry["vz"] = vz
+                    if dist <= LOD_NEAR_DIST: near_pos[other_uid] = entry
+                    else:                    far_pos[other_uid]  = entry
+
                 payload = dict(near_pos)
                 if send_slow: payload.update(far_pos)
                 if payload:
                     try:
                         await pinfo["ws"].send_text(
-                            json.dumps({"t": "pos_sync", "positions": payload, "ts": int(time.time()*1000)}, ensure_ascii=False))
+                            json.dumps({"t": "pos_sync", "positions": payload,
+                                        "ts": int(time.time()*1000)}, ensure_ascii=False))
                     except: pass
+
+        # 루프 종료 전 prev 정리
+        player_prev_positions.pop(room_code, None)
     except asyncio.CancelledError: pass
     except Exception as e:
         print(f"[PosSync] 오류: {e}", flush=True)
 
 
+def _build_pos_with_vel(room_code: str, pos: dict) -> dict:
+    """전체 위치 딕셔너리에 velocity 힌트를 추가해 반환"""
+    result = {}
+    for uid, p in pos.items():
+        vx, vz = _calc_velocity(room_code, uid, p)
+        entry = dict(p); entry["vx"] = vx; entry["vz"] = vz
+        result[uid] = entry
+    return result
+
+
 async def ai_move_loop(room_code):
-    print(f"[AiMove] {room_code} 시작 (틱레이트: {AI_MOVE_UPDATE_RATE}s)", flush=True)
+    print(f"[AiMove] {room_code} 시작 (틱레이트: {TICK_RATE*1000:.1f}ms / 15Hz)", flush=True)
     ai_local: dict = {}
     try:
         while room_code in sessions and sessions[room_code]["status"] == "playing":
@@ -388,11 +430,18 @@ async def ai_move_loop(room_code):
             pos_store = player_positions.get(room_code, {})
             dl_store  = doorlock_states.get(room_code, {})
 
+            # ★ v8.6: AI 이동 전에 prev 저장
+            prev_store = player_prev_positions.setdefault(room_code, {})
+
             for ai_uid, pinfo in players.items():
                 if not pinfo.get("isAI"): continue
                 if not alive.get(ai_uid):  continue
                 cur = pos_store.get(ai_uid)
                 if cur is None: continue
+
+                # prev 저장 (이동 전)
+                prev_store[ai_uid] = dict(cur)
+
                 role = roles.get(ai_uid, "citizen")
                 if ai_uid not in ai_local:
                     ai_local[ai_uid] = {
@@ -736,7 +785,6 @@ async def ai_do_vote_actions(room_code):
     await asyncio.gather(*[_vote(uid) for uid in ai_uids], return_exceptions=True)
 
 
-# ★ v8.5 핵심 수정: init_session — pre_connections에서 WS 복구
 async def init_session(room_code, room_data):
     pdata    = room_data.get("players", {})
     host_uid = room_data.get("hostId", "")
@@ -769,6 +817,7 @@ async def init_session(room_code, room_data):
     init_doorlocks(room_code, gs)
 
     player_positions[room_code] = {}
+    player_prev_positions[room_code] = {}
     for i, uid in enumerate(uids):
         angle = (2 * math.pi / max(total, 1)) * i
         player_positions[room_code][uid] = {
@@ -781,10 +830,7 @@ async def init_session(room_code, room_data):
 
     await save_gs(room_code, gs)
 
-    # ★ v8.5: 기존 세션 + pre_connections 양쪽에서 WS 복구
     old_ws = {}
-
-    # 1) 기존 sessions에서 복구
     if room_code in sessions:
         for tk in ("phase_task", "pos_task", "ai_move_task"):
             t = sessions[room_code].get(tk)
@@ -793,7 +839,6 @@ async def init_session(room_code, room_data):
             if not p.get("isAI") and p.get("ws"):
                 old_ws[uid] = p
 
-    # 2) pre_connections에서 추가 복구 (대기실에서 WS 연결만 된 클라이언트)
     pre = pre_connections.get(room_code, {})
     for uid, ws_obj in pre.items():
         if uid not in old_ws and uid in pdata and not pdata[uid].get("isAI", False):
@@ -802,7 +847,7 @@ async def init_session(room_code, room_data):
                 "ws": ws_obj, "nickname": pi.get("nickname", "?"),
                 "tag": pi.get("tag", "0000"), "isHost": pi.get("isHost", False), "isAI": False
             }
-    pre_connections.pop(room_code, None)  # 정리
+    pre_connections.pop(room_code, None)
 
     sessions[room_code] = {
         "players": {}, "phase_task": None, "pos_task": None,
@@ -819,9 +864,7 @@ async def init_session(room_code, room_data):
     return gs
 
 
-# ★ v8.5: _send_joined_to_all — 게임 시작 시 모든 연결 플레이어에게 joined 전송
 async def _send_joined_to_all(room_code: str, gs: dict):
-    """init_session 후 세션에 등록된 모든 플레이어에게 joined 메시지를 전송"""
     if room_code not in sessions: return
     dl = doorlock_states.get(room_code, {})
     ha = gs.get("house_assignments", {})
@@ -1011,6 +1054,7 @@ async def _cleanup(room_code, delay=60):
     await asyncio.sleep(delay)
     if room_code in sessions and sessions[room_code]["status"] == "ended":
         sessions.pop(room_code, None); player_positions.pop(room_code, None)
+        player_prev_positions.pop(room_code, None)
         doorlock_states.pop(room_code, None); attack_cooldowns.pop(room_code, None)
         ai_move_targets.pop(room_code, None); baguette_hits.pop(room_code, None)
         pre_connections.pop(room_code, None)
@@ -1045,7 +1089,7 @@ def _ensure_loop(room_code):
 async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX: _http_client = httpx.AsyncClient(timeout=5.0)
-    print("[Startup] 브레드 킬러 서버 v8.5 준비 완료", flush=True)
+    print(f"[Startup] 브레드 킬러 서버 v8.6 준비 완료 | 틱={TICK_RATE*1000:.1f}ms", flush=True)
     yield
     if _http_client: await _http_client.aclose()
 
@@ -1075,7 +1119,6 @@ async def http_start(request: Request):
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "playing"})
 
     real = [uid for uid, p in gs["players"].items() if not p.get("isAI")]
-    # ★ v8.5: 루프 시작 전 모든 기존 연결 플레이어에게 joined 전송
     await _send_joined_to_all(room_code, gs)
 
     if len(real) == 0 or _should_start(room_code, gs):
@@ -1109,11 +1152,9 @@ async def ws_mafia(ws: WebSocket):
                 uid       = msg.get("uid", "")
                 room_code = msg.get("room_code", "").upper().strip()
 
-                # ★ v8.5: 세션이 없으면 pre_connections에 등록 (게임 시작 전 대기)
                 if room_code not in sessions:
                     pre_connections.setdefault(room_code, {})[uid] = ws
                     print(f"[PreConn] {room_code} / {uid} 대기 등록", flush=True)
-                    # 오류 전송 대신 대기 중임을 알림
                     await ws.send_text(json.dumps({"t": "waiting", "r": "session_not_ready"}))
                     continue
 
@@ -1138,7 +1179,6 @@ async def ws_mafia(ws: WebSocket):
                 hi       = doorlock_states.get(room_code, {}).get(my_house, {})
                 eco      = get_economy(gs, uid)
 
-                # ★ v8.5: player_data 포함해서 broadcast (방 입장자도 다른 플레이어 스폰 가능)
                 await ws.send_text(json.dumps({
                     "t": "joined", "uid": uid, "role": my_role,
                     "roles": gs["roles"], "phase": gs["phase"], "day": gs["day"],
@@ -1166,7 +1206,6 @@ async def ws_mafia(ws: WebSocket):
                         "msg": f"당신의 집은 {num}번 집입니다! 집 위치를 확인하세요."
                     })
 
-                # ★ v8.5: player_data 포함 broadcast
                 await broadcast(room_code, {
                     "t": "player_joined",
                     "uid": uid,
@@ -1181,6 +1220,10 @@ async def ws_mafia(ws: WebSocket):
             elif t == "pos_update":
                 if not (uid and room_code): continue
                 if room_code not in player_positions: player_positions[room_code] = {}
+                # ★ v8.6: 실제 플레이어도 prev 저장
+                old = player_positions[room_code].get(uid)
+                if old:
+                    player_prev_positions.setdefault(room_code, {})[uid] = dict(old)
                 player_positions[room_code][uid] = {
                     "x": float(msg.get("x", 0)), "y": float(msg.get("y", 0)),
                     "z": float(msg.get("z", 0)), "rot_y": float(msg.get("rot_y", 0)),
@@ -1344,7 +1387,6 @@ async def ws_mafia(ws: WebSocket):
         print(f"[WS 오류] uid={uid}: {e}", flush=True)
     finally:
         if uid and room_code:
-            # pre_connections 정리
             if room_code in pre_connections:
                 pre_connections[room_code].pop(uid, None)
             if room_code in sessions:
@@ -1371,8 +1413,9 @@ async def _process_hack(room_code, hacker_uid, house_id):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "version": "v8.5", "sessions": len(sessions),
-            "rooms": list(sessions.keys()), "httpx": _USE_HTTPX, "redis": bool(REDIS_URL)}
+    return {"status": "ok", "version": "v8.6", "tick_ms": round(TICK_RATE*1000, 1),
+            "sessions": len(sessions), "rooms": list(sessions.keys()),
+            "httpx": _USE_HTTPX, "redis": bool(REDIS_URL)}
 
 @app.head("/")
 async def health_head():
@@ -1382,5 +1425,5 @@ async def health_head():
 if __name__ == "__main__":
     for var, name in [(RTDB_SECRET,"RTDB_SECRET"),(REDIS_URL,"REDIS_URL"),(REDIS_TOKEN,"REDIS_TOKEN")]:
         if not var: print(f"[경고] {name} 없음", flush=True)
-    print(f"[Server] 포트 {WS_PORT}", flush=True)
+    print(f"[Server] 포트 {WS_PORT} | 틱레이트 15Hz ({TICK_RATE*1000:.1f}ms)", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=WS_PORT, ws_ping_interval=20, ws_ping_timeout=30)
