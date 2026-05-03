@@ -1,11 +1,12 @@
 """
-mafia_server.py — 브레드 킬러 서버 v8.6
-[v8.6 수정사항]
-  1. AI_MOVE_UPDATE_RATE = 1/15 ≈ 0.0667 (15Hz 틱레이트)
-  2. POSITION_SYNC_INTERVAL = 1/15 ≈ 0.0667 (위치 동기화도 15Hz)
-  3. pos_sync 페이로드에 velocity 힌트(vx, vz) 추가 → 클라이언트 데드 레코닝 지원
-  4. AI 위치에 prev 값 저장 → velocity 계산용
-  5. 나머지 게임 로직은 v8.5 그대로 유지
+mafia_server.py — 브레드 킬러 서버 v8.7
+[v8.7 수정사항]
+  1. LOD_NEAR_DIST: 20.0 → 60.0
+     → AI가 맵 어디에 있든 매 틱 pos_sync에 포함됨
+     → 호스트 눈에 AI가 안 움직이던 문제 해결
+  2. slow_tick far_pos 전송 조건 제거 → 항상 near+far 합산 전송
+     → 5틱에 한 번만 원거리 전송하던 방식 폐지, 매 틱 전체 전송
+  나머지 게임 로직은 v8.6 그대로 유지
 """
 import asyncio, json, os, random, time, math
 from contextlib import asynccontextmanager
@@ -36,10 +37,9 @@ PHASE_CYCLE = ["night", "morning", "day", "dusk"]
 MAX_ROUNDS  = 10
 SESSION_TTL = 3600
 
-# ★ v8.6 핵심: 15Hz 틱레이트
-TICK_RATE              = 1.0 / 15.0          # ≈ 0.0667s
-POSITION_SYNC_INTERVAL = TICK_RATE           # 위치 동기화 주기
-AI_MOVE_UPDATE_RATE    = TICK_RATE           # AI 이동 계산 주기
+TICK_RATE              = 1.0 / 15.0
+POSITION_SYNC_INTERVAL = TICK_RATE
+AI_MOVE_UPDATE_RATE    = TICK_RATE
 
 DOORLOCK_HACK_DURATION = 15.0
 DOORLOCK_SUCCESS_RATE  = 0.67
@@ -63,7 +63,9 @@ AI_ACTION_DELAY_MAX  = 10
 AI_COSINE_AMPLITUDE  = 1.8
 AI_COSINE_FREQUENCY  = 0.9
 
-LOD_NEAR_DIST = 20.0
+# ★ v8.7 핵심: LOD 거리를 맵 전체 커버하도록 확대
+# 기존 20.0 → 60.0: AI가 맵 어디에 있든 매 틱 pos_sync에 포함됨
+LOD_NEAR_DIST = 60.0
 
 WORLD_BOUND   = 48.0
 HOUSE_SPACING = 14.0
@@ -80,13 +82,12 @@ for _v in [(-28,-14),(28,-14),(-28,14),(28,14),(-14,-28),(14,-28),(-14,28),(14,2
 HOUSE_HALF    = 2.8
 DOOR_OFFSET_Z = 2.52
 
-print(f"=== 브레드 킬러 서버 v8.6 | 틱={TICK_RATE*1000:.1f}ms(15Hz) | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
+print(f"=== 브레드 킬러 서버 v8.7 | 틱={TICK_RATE*1000:.1f}ms(15Hz) | LOD={LOD_NEAR_DIST}m | httpx={_USE_HTTPX} | redis={bool(REDIS_URL)} ===", flush=True)
 
 sessions:         dict = {}
 _mem_store:       dict = {}
 _http_client           = None
 player_positions: dict = {}
-# ★ v8.6: AI 이전 위치 저장용 (velocity 계산)
 player_prev_positions: dict = {}
 doorlock_states:  dict = {}
 attack_cooldowns: dict = {}
@@ -333,13 +334,11 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str,
     return False
 
 
-# ★ v8.6: velocity 계산 헬퍼
 def _calc_velocity(room_code: str, uid: str, cur: dict) -> tuple:
-    """이전 프레임 대비 velocity(units/sec) 반환"""
     prev = player_prev_positions.get(room_code, {}).get(uid)
     if not prev:
         return 0.0, 0.0
-    dt = TICK_RATE  # 틱레이트가 일정하므로 상수 사용
+    dt = TICK_RATE
     if dt <= 0:
         return 0.0, 0.0
     vx = (cur.get("x", 0) - prev.get("x", 0)) / dt
@@ -348,24 +347,26 @@ def _calc_velocity(room_code: str, uid: str, cur: dict) -> tuple:
 
 
 async def position_sync_loop(room_code):
-    """★ v8.6: 15Hz 동기화 + velocity 힌트 포함"""
-    slow_tick = 0
+    """
+    ★ v8.7: LOD_NEAR_DIST=60m으로 확대 + 항상 전체 전송
+    - 기존 slow_tick % 5 far_pos 조건 제거
+    - 매 틱 near+far 전부 합산해서 전송
+    - AI가 맵 어디에 있든 호스트 포함 모든 플레이어에게 전달됨
+    """
     try:
         while room_code in sessions and sessions[room_code]["status"] == "playing":
             await asyncio.sleep(POSITION_SYNC_INTERVAL)
             pos = player_positions.get(room_code, {})
             if not pos: continue
-            slow_tick += 1
-            # 5틱마다(~333ms) 원거리 플레이어도 포함
-            send_slow = (slow_tick % 5 == 0)
             sess = sessions.get(room_code, {})
 
             for uid, pinfo in list(sess.get("players", {}).items()):
                 if pinfo.get("isAI"): continue
                 my_pos = pos.get(uid)
+
                 if not my_pos:
+                    # 내 위치 없으면 전체 전송
                     try:
-                        # velocity 포함 전체 전송
                         pos_with_vel = _build_pos_with_vel(room_code, pos)
                         await pinfo["ws"].send_text(
                             json.dumps({"t": "pos_sync", "positions": pos_with_vel,
@@ -374,21 +375,19 @@ async def position_sync_loop(room_code):
                     continue
 
                 mx, mz = my_pos.get("x", 0), my_pos.get("z", 0)
-                near_pos = {}; far_pos = {}
+                payload = {}
                 for other_uid, other_p in pos.items():
                     if other_uid == uid: continue
                     dx   = other_p.get("x", 0) - mx
                     dz   = other_p.get("z", 0) - mz
                     dist = math.sqrt(dx*dx + dz*dz)
-                    # velocity 힌트 추가
                     vx, vz = _calc_velocity(room_code, other_uid, other_p)
                     entry = dict(other_p)
                     entry["vx"] = vx; entry["vz"] = vz
-                    if dist <= LOD_NEAR_DIST: near_pos[other_uid] = entry
-                    else:                    far_pos[other_uid]  = entry
+                    # ★ v8.7: LOD_NEAR_DIST=60m → 맵 전체 커버, 분기 불필요
+                    if dist <= LOD_NEAR_DIST:
+                        payload[other_uid] = entry
 
-                payload = dict(near_pos)
-                if send_slow: payload.update(far_pos)
                 if payload:
                     try:
                         await pinfo["ws"].send_text(
@@ -396,7 +395,6 @@ async def position_sync_loop(room_code):
                                         "ts": int(time.time()*1000)}, ensure_ascii=False))
                     except: pass
 
-        # 루프 종료 전 prev 정리
         player_prev_positions.pop(room_code, None)
     except asyncio.CancelledError: pass
     except Exception as e:
@@ -404,7 +402,6 @@ async def position_sync_loop(room_code):
 
 
 def _build_pos_with_vel(room_code: str, pos: dict) -> dict:
-    """전체 위치 딕셔너리에 velocity 힌트를 추가해 반환"""
     result = {}
     for uid, p in pos.items():
         vx, vz = _calc_velocity(room_code, uid, p)
@@ -430,7 +427,6 @@ async def ai_move_loop(room_code):
             pos_store = player_positions.get(room_code, {})
             dl_store  = doorlock_states.get(room_code, {})
 
-            # ★ v8.6: AI 이동 전에 prev 저장
             prev_store = player_prev_positions.setdefault(room_code, {})
 
             for ai_uid, pinfo in players.items():
@@ -439,7 +435,6 @@ async def ai_move_loop(room_code):
                 cur = pos_store.get(ai_uid)
                 if cur is None: continue
 
-                # prev 저장 (이동 전)
                 prev_store[ai_uid] = dict(cur)
 
                 role = roles.get(ai_uid, "citizen")
@@ -1089,7 +1084,7 @@ def _ensure_loop(room_code):
 async def lifespan(app: FastAPI):
     global _http_client
     if _USE_HTTPX: _http_client = httpx.AsyncClient(timeout=5.0)
-    print(f"[Startup] 브레드 킬러 서버 v8.6 준비 완료 | 틱={TICK_RATE*1000:.1f}ms", flush=True)
+    print(f"[Startup] 브레드 킬러 서버 v8.7 준비 완료 | 틱={TICK_RATE*1000:.1f}ms | LOD={LOD_NEAR_DIST}m", flush=True)
     yield
     if _http_client: await _http_client.aclose()
 
@@ -1220,7 +1215,6 @@ async def ws_mafia(ws: WebSocket):
             elif t == "pos_update":
                 if not (uid and room_code): continue
                 if room_code not in player_positions: player_positions[room_code] = {}
-                # ★ v8.6: 실제 플레이어도 prev 저장
                 old = player_positions[room_code].get(uid)
                 if old:
                     player_prev_positions.setdefault(room_code, {})[uid] = dict(old)
@@ -1413,7 +1407,8 @@ async def _process_hack(room_code, hacker_uid, house_id):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "version": "v8.6", "tick_ms": round(TICK_RATE*1000, 1),
+    return {"status": "ok", "version": "v8.7", "tick_ms": round(TICK_RATE*1000, 1),
+            "lod_dist": LOD_NEAR_DIST,
             "sessions": len(sessions), "rooms": list(sessions.keys()),
             "httpx": _USE_HTTPX, "redis": bool(REDIS_URL)}
 
@@ -1425,5 +1420,5 @@ async def health_head():
 if __name__ == "__main__":
     for var, name in [(RTDB_SECRET,"RTDB_SECRET"),(REDIS_URL,"REDIS_URL"),(REDIS_TOKEN,"REDIS_TOKEN")]:
         if not var: print(f"[경고] {name} 없음", flush=True)
-    print(f"[Server] 포트 {WS_PORT} | 틱레이트 15Hz ({TICK_RATE*1000:.1f}ms)", flush=True)
+    print(f"[Server] 포트 {WS_PORT} | 틱레이트 15Hz ({TICK_RATE*1000:.1f}ms) | LOD={LOD_NEAR_DIST}m", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=WS_PORT, ws_ping_interval=20, ws_ping_timeout=30)
