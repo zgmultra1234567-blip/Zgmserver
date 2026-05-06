@@ -13,8 +13,9 @@ from config import (
     AI_COSINE_AMPLITUDE, AI_COSINE_FREQUENCY,
     LOD_NEAR_DIST, HOUSE_CENTERS, HOUSE_HALF,
     DOORLOCK_HACK_DURATION, DOORLOCK_SUCCESS_RATE,
+    DEBUG,
 )
-from state import RoomState, rooms, ai_local_state
+from state import RoomState, rooms, ai_local_state, get_room_lock
 from storage import load_gs, save_gs, delete_gs, rtdb_patch, http_delete
 from world import safe_move, safe_target, is_inside_house, push_out_of_houses, clamp_to_world
 from network import broadcast, send_to
@@ -53,6 +54,41 @@ def give_morning_bread(gs: dict) -> dict:
             gs["economy"].setdefault(uid, {"bread": 0, "batteries": 1, "potions": 0, "flashlight_on": False})
             gs["economy"][uid]["bread"] += MORNING_BREAD
     return gs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gs 캐시 헬퍼 (A급: Redis 과호출 방지)
+# ─────────────────────────────────────────────────────────────────────────────
+def _gs_from_cache(room_code: str) -> dict:
+    """RoomState 캐시에서 gs를 읽음. 없으면 빈 dict."""
+    rs = rooms.get(room_code)
+    if rs and rs.gs:
+        return rs.gs
+    return {}
+
+
+def _gs_update_cache(room_code: str, gs: dict):
+    """gs를 RoomState 캐시에 저장."""
+    rs = rooms.get(room_code)
+    if rs:
+        rs.gs = gs
+
+
+async def _load_gs_cached(room_code: str) -> dict:
+    """캐시 우선 로드. 캐시 없으면 Redis에서 가져와 캐시에 저장."""
+    rs = rooms.get(room_code)
+    if rs and rs.gs:
+        return rs.gs
+    gs = await load_gs(room_code)
+    if rs:
+        rs.gs = gs
+    return gs
+
+
+async def _save_gs_cached(room_code: str, gs: dict):
+    """캐시 갱신 + Redis 저장."""
+    _gs_update_cache(room_code, gs)
+    await save_gs(room_code, gs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,66 +198,70 @@ async def process_baguette_hit(room_code: str, killer_uid: str, target_uid: str)
     rs = rooms.get(room_code)
     if not rs:
         return False
-    gs = await load_gs(room_code)
-    if not gs:
-        return False
 
-    if gs.get("phase") != "night":
-        await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "not_night"}); return False
-    if gs["roles"].get(killer_uid) != "mafia":
-        await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "not_mafia"}); return False
-    if not gs["alive"].get(killer_uid):
-        return False
-    if not gs["alive"].get(target_uid):
-        await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "target_dead"}); return False
+    # S급: room lock으로 gs 레이스 방지
+    async with get_room_lock(room_code):
+        gs = await _load_gs_cached(room_code)
+        if not gs:
+            return False
 
-    mp = rs.positions.get(killer_uid, {})
-    tp = rs.positions.get(target_uid, {})
-    if not mp or not tp:
-        await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "no_position"}); return False
+        if gs.get("phase") != "night":
+            await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "not_night"}); return False
+        if gs["roles"].get(killer_uid) != "mafia":
+            await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "not_mafia"}); return False
+        if not gs["alive"].get(killer_uid):
+            return False
+        if not gs["alive"].get(target_uid):
+            await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "target_dead"}); return False
 
-    dist = math.sqrt((mp["x"] - tp["x"]) ** 2 + (mp["z"] - tp["z"]) ** 2)
-    if dist > BAGUETTE_RANGE:
-        await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "too_far", "dist": round(dist, 2)}); return False
+        mp = rs.positions.get(killer_uid, {})
+        tp = rs.positions.get(target_uid, {})
+        if not mp or not tp:
+            await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "no_position"}); return False
 
-    now      = time.time()
-    last_atk = rs.attack_cooldowns.get(killer_uid, 0.0)
-    if now - last_atk < BAGUETTE_HIT_COOLDOWN:
-        return False
-    rs.attack_cooldowns[killer_uid] = now
+        dist = math.sqrt((mp["x"] - tp["x"]) ** 2 + (mp["z"] - tp["z"]) ** 2)
+        if dist > BAGUETTE_RANGE:
+            await send_to(room_code, killer_uid, {"t": "attack_failed", "r": "too_far", "dist": round(dist, 2)}); return False
 
-    hs = _get_hit_state(rs, killer_uid, target_uid)
-    if now - hs["last_hit"] > BAGUETTE_HIT_RESET:
-        hs["count"] = 0
-    hs["count"]  += 1
-    hs["last_hit"] = now
-    hit_count = hs["count"]
-    print(f"[Baguette] {killer_uid} -> {target_uid} | {hit_count}/{BAGUETTE_HITS_TO_KILL}타", flush=True)
+        now      = time.time()
+        last_atk = rs.attack_cooldowns.get(killer_uid, 0.0)
+        if now - last_atk < BAGUETTE_HIT_COOLDOWN:
+            return False
+        rs.attack_cooldowns[killer_uid] = now
 
-    await send_to(room_code, target_uid, {
-        "t": "baguette_hit_received", "from": killer_uid,
-        "hp": BAGUETTE_HITS_TO_KILL - hit_count,
-    })
+        hs = _get_hit_state(rs, killer_uid, target_uid)
+        if now - hs["last_hit"] > BAGUETTE_HIT_RESET:
+            hs["count"] = 0
+        hs["count"]  += 1
+        hs["last_hit"] = now
+        hit_count = hs["count"]
+        if DEBUG:
+            print(f"[Baguette] {killer_uid} -> {target_uid} | {hit_count}/{BAGUETTE_HITS_TO_KILL}타", flush=True)
 
-    if hit_count >= BAGUETTE_HITS_TO_KILL:
-        _reset_hit_state(rs, killer_uid, target_uid)
-        gs["alive"][target_uid] = False
-        await save_gs(room_code, gs)
-        await broadcast(room_code, {
-            "t": "baguette_kill", "killer": killer_uid, "victim": target_uid,
-            "pos_x": tp.get("x", 0), "pos_z": tp.get("z", 0),
+        await send_to(room_code, target_uid, {
+            "t": "baguette_hit_received", "from": killer_uid,
+            "hp": BAGUETTE_HITS_TO_KILL - hit_count,
         })
-        print(f"[Baguette] 킬 확정: {killer_uid} -> {target_uid}", flush=True)
-        winner = check_win(gs)
-        if winner:
-            await end_game(room_code, gs, winner, "baguette")
-        return True
 
-    await send_to(room_code, killer_uid, {
-        "t": "baguette_hit_ok", "target": target_uid,
-        "hit_count": hit_count, "hits_need": BAGUETTE_HITS_TO_KILL,
-    })
-    return False
+        if hit_count >= BAGUETTE_HITS_TO_KILL:
+            _reset_hit_state(rs, killer_uid, target_uid)
+            gs["alive"][target_uid] = False
+            await _save_gs_cached(room_code, gs)
+            await broadcast(room_code, {
+                "t": "baguette_kill", "killer": killer_uid, "victim": target_uid,
+                "pos_x": tp.get("x", 0), "pos_z": tp.get("z", 0),
+            })
+            print(f"[Baguette] 킬 확정: {killer_uid} -> {target_uid}", flush=True)
+            winner = check_win(gs)
+            if winner:
+                await end_game(room_code, gs, winner, "baguette")
+            return True
+
+        await send_to(room_code, killer_uid, {
+            "t": "baguette_hit_ok", "target": target_uid,
+            "hit_count": hit_count, "hits_need": BAGUETTE_HITS_TO_KILL,
+        })
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,7 +353,7 @@ async def process_votes(room_code: str, gs: dict) -> str:
 # AI 행동 (밤 / 낮 투표)
 # ─────────────────────────────────────────────────────────────────────────────
 async def ai_do_night_actions(room_code: str):
-    gs = await load_gs(room_code)
+    gs = await _load_gs_cached(room_code)
     if not gs or gs.get("phase") != "night":
         return
     ai_uids = [uid for uid, p in gs["players"].items() if p.get("isAI") and gs["alive"].get(uid)]
@@ -324,32 +364,30 @@ async def ai_do_night_actions(room_code: str):
         if random.random() < AI_IDLE_CHANCE:
             return
         await asyncio.sleep(random.uniform(AI_ACTION_DELAY_MIN, AI_ACTION_DELAY_MAX))
-        cgs = await load_gs(room_code)
-        if not cgs or cgs.get("phase") != "night" or not cgs["alive"].get(uid):
-            return
-        role = cgs["roles"].get(uid, "citizen")
-        cal  = [u for u, a in cgs["alive"].items() if a]
-        field = None; tgt = None
-        if role == "mafia":
-            c2 = [u for u in cal if u != uid and cgs["roles"].get(u) != "mafia"]
-            if c2: field = "night_votes"; tgt = random.choice(c2)
-        elif role == "doctor":
-            if cal: field = "doctor_protect"; tgt = random.choice(cal)
-        elif role == "police":
-            c2 = [u for u in cal if u != uid]
-            if c2: field = "police_investigate"; tgt = random.choice(c2)
-        if field and tgt:
-            fgs = await load_gs(room_code)
-            if not fgs or fgs.get("phase") != "night":
+        async with get_room_lock(room_code):
+            cgs = await _load_gs_cached(room_code)
+            if not cgs or cgs.get("phase") != "night" or not cgs["alive"].get(uid):
                 return
-            fgs[field][uid] = tgt
-            await save_gs(room_code, fgs)
+            role = cgs["roles"].get(uid, "citizen")
+            cal  = [u for u, a in cgs["alive"].items() if a]
+            field = None; tgt = None
+            if role == "mafia":
+                c2 = [u for u in cal if u != uid and cgs["roles"].get(u) != "mafia"]
+                if c2: field = "night_votes"; tgt = random.choice(c2)
+            elif role == "doctor":
+                if cal: field = "doctor_protect"; tgt = random.choice(cal)
+            elif role == "police":
+                c2 = [u for u in cal if u != uid]
+                if c2: field = "police_investigate"; tgt = random.choice(c2)
+            if field and tgt:
+                cgs[field][uid] = tgt
+                await _save_gs_cached(room_code, cgs)
 
     await asyncio.gather(*[_act(uid) for uid in ai_uids], return_exceptions=True)
 
 
 async def ai_do_vote_actions(room_code: str):
-    gs = await load_gs(room_code)
+    gs = await _load_gs_cached(room_code)
     if not gs or gs.get("phase") != "vote":
         return
     ai_uids = [uid for uid, p in gs["players"].items() if p.get("isAI") and gs["alive"].get(uid)]
@@ -360,19 +398,17 @@ async def ai_do_vote_actions(room_code: str):
         if random.random() < AI_IDLE_CHANCE:
             return
         await asyncio.sleep(random.uniform(AI_ACTION_DELAY_MIN, AI_ACTION_DELAY_MAX))
-        cgs = await load_gs(room_code)
-        if not cgs or cgs.get("phase") != "vote" or not cgs["alive"].get(uid):
-            return
-        role = cgs["roles"].get(uid, "citizen")
-        cal  = [u for u, a in cgs["alive"].items() if a]
-        c2   = [u for u in cal if u != uid and (cgs["roles"].get(u) != "mafia" if role == "mafia" else True)]
-        if not c2:
-            return
-        fgs = await load_gs(room_code)
-        if not fgs or fgs.get("phase") != "vote":
-            return
-        fgs["day_votes"][uid] = random.choice(c2)
-        await save_gs(room_code, fgs)
+        async with get_room_lock(room_code):
+            cgs = await _load_gs_cached(room_code)
+            if not cgs or cgs.get("phase") != "vote" or not cgs["alive"].get(uid):
+                return
+            role = cgs["roles"].get(uid, "citizen")
+            cal  = [u for u, a in cgs["alive"].items() if a]
+            c2   = [u for u in cal if u != uid and (cgs["roles"].get(u) != "mafia" if role == "mafia" else True)]
+            if not c2:
+                return
+            cgs["day_votes"][uid] = random.choice(c2)
+            await _save_gs_cached(room_code, cgs)
 
     await asyncio.gather(*[_vote(uid) for uid in ai_uids], return_exceptions=True)
 
@@ -381,9 +417,13 @@ async def ai_do_vote_actions(room_code: str):
 # AI 이동 (전역 스케줄러에서 호출)
 # ─────────────────────────────────────────────────────────────────────────────
 async def tick_ai_for_room(room_code: str, rs: RoomState):
-    gs = await load_gs(room_code)
+    # A급: Redis 대신 캐시에서 읽음
+    gs = _gs_from_cache(room_code)
+    if not gs:
+        gs = await _load_gs_cached(room_code)
     if not gs:
         return
+
     phase       = gs.get("phase", "meet")
     roles       = gs.get("roles", {})
     alive       = gs.get("alive", {})
@@ -485,12 +525,13 @@ async def _do_ai_baguette_hit(room_code, ai_uid, target_uid, cx, cz, gs, st):
         hs["count"] = 0
     hs["count"]  += 1
     hs["last_hit"] = now
-    print(f"[AI-Hit] {ai_uid}->{target_uid} {hs['count']}/{BAGUETTE_HITS_TO_KILL}", flush=True)
+    if DEBUG:
+        print(f"[AI-Hit] {ai_uid}->{target_uid} {hs['count']}/{BAGUETTE_HITS_TO_KILL}", flush=True)
 
     if hs["count"] >= BAGUETTE_HITS_TO_KILL:
         _reset_hit_state(rs, ai_uid, target_uid)
         gs["alive"][target_uid] = False
-        await save_gs(room_code, gs)
+        await _save_gs_cached(room_code, gs)
         tp = rs.positions.get(target_uid, {})
         await broadcast(room_code, {
             "t": "baguette_kill", "killer": ai_uid, "victim": target_uid,
@@ -681,9 +722,18 @@ async def position_sync_loop(room_code: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 전역 AI 스케줄러
+# 전역 AI 스케줄러 (S급: 중복 실행 방지)
 # ─────────────────────────────────────────────────────────────────────────────
+_AI_SCHEDULER_RUNNING = False
+
+
 async def global_ai_scheduler():
+    global _AI_SCHEDULER_RUNNING
+    # S급: 이미 실행 중이면 즉시 리턴
+    if _AI_SCHEDULER_RUNNING:
+        print("[AI-Sched] 이미 실행 중 — 중복 방지로 종료", flush=True)
+        return
+    _AI_SCHEDULER_RUNNING = True
     print("[AI-Sched] 전역 AI 스케줄러 시작", flush=True)
     try:
         while True:
@@ -698,6 +748,8 @@ async def global_ai_scheduler():
                     print(f"[AI-Sched] {room_code} 오류: {e}\n{traceback.format_exc()}", flush=True)
     except asyncio.CancelledError:
         print("[AI-Sched] 종료", flush=True)
+    finally:
+        _AI_SCHEDULER_RUNNING = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,6 +793,11 @@ async def init_session(room_code: str, room_data: dict, pre_connections: dict) -
         old_rs = rooms[room_code]
         if old_rs.phase_task and not old_rs.phase_task.done(): old_rs.phase_task.cancel()
         if old_rs.pos_task   and not old_rs.pos_task.done():   old_rs.pos_task.cancel()
+        # 준버그: 남은 task도 전부 정리
+        for t in old_rs.tasks:
+            if not t.done():
+                t.cancel()
+        old_rs.tasks.clear()
         for uid, p in old_rs.players.items():
             if not p.get("isAI") and p.get("ws"):
                 old_ws[uid] = p
@@ -780,6 +837,8 @@ async def init_session(room_code: str, room_data: dict, pre_connections: dict) -
                 "isHost": pi.get("isHost", False), "isAI": False,
             }
 
+    # gs 캐시 초기화
+    rs.gs = gs
     await save_gs(room_code, gs)
     print(f"[Init] {room_code} | {total}명 | {rc} | WS복구={len(rs.players)}명", flush=True)
     return gs
@@ -809,7 +868,8 @@ async def send_joined_to_all(room_code: str, gs: dict):
                 "mafia_team": {pid: r for pid, r in gs["roles"].items() if r == "mafia"}
                     if my_role == "mafia" else {},
             }, ensure_ascii=False))
-            print(f"[Init] joined 전송: {uid}", flush=True)
+            if DEBUG:
+                print(f"[Init] joined 전송: {uid}", flush=True)
         except Exception as e:
             print(f"[Init] joined 전송 실패 {uid}: {e}", flush=True)
 
@@ -839,7 +899,7 @@ async def send_house_hints(room_code: str, gs: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 async def end_game(room_code: str, gs: dict, winner: str, reason: str):
     gs["phase"] = "result"; gs["winner"] = winner
-    await save_gs(room_code, gs)
+    await _save_gs_cached(room_code, gs)
     await broadcast(room_code, {
         "t": "game_result", "winner": winner, "reason": reason,
         "roles": gs["roles"], "alive": gs["alive"], "day": gs["day"],
@@ -847,7 +907,13 @@ async def end_game(room_code: str, gs: dict, winner: str, reason: str):
     rs = rooms.get(room_code)
     if rs:
         rs.status = "ended"
+        rs.phase_running = False
         if rs.pos_task and not rs.pos_task.done(): rs.pos_task.cancel()
+        # 준버그: 남은 task 전부 정리
+        for t in rs.tasks:
+            if not t.done():
+                t.cancel()
+        rs.tasks.clear()
     ai_local_state.pop(room_code, None)
     await rtdb_patch(f"rooms/{room_code}", {"gameStatus": "ended"})
     asyncio.create_task(_delete_ai_rtdb(room_code, gs))
@@ -873,17 +939,29 @@ async def _cleanup(room_code: str, delay: int = 60):
     if rs and rs.status == "ended":
         rooms.pop(room_code, None)
         ai_local_state.pop(room_code, None)
+        from state import room_locks
+        room_locks.pop(room_code, None)
         await delete_gs(room_code)
         print(f"[Cleanup] {room_code} 삭제", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 페이즈 루프
+# 페이즈 루프 (S급: phase_running으로 중복 실행 방지)
 # ─────────────────────────────────────────────────────────────────────────────
 async def phase_loop(room_code: str):
+    rs = rooms.get(room_code)
+    if not rs:
+        return
+
+    # S급: 중복 실행 방지
+    if rs.phase_running:
+        print(f"[Phase] {room_code} 이미 실행 중 — 중복 방지로 종료", flush=True)
+        return
+    rs.phase_running = True
+
     print(f"[Phase] {room_code} 루프 시작", flush=True)
     try:
-        gs = await load_gs(room_code)
+        gs = await _load_gs_cached(room_code)
         phase_queue = ["meet"] + PHASE_CYCLE * (MAX_ROUNDS + 2)
 
         for phase in phase_queue:
@@ -891,6 +969,7 @@ async def phase_loop(room_code: str):
             if not rs or rs.status != "playing":
                 return
             gs["phase"] = phase
+            _gs_update_cache(room_code, gs)
             await save_gs(room_code, gs)
             wait = PHASE_TIMES.get(phase, 60)
 
@@ -902,13 +981,16 @@ async def phase_loop(room_code: str):
                     "house_lights": False, "plaza_lights": True, "street_lights_energy": 3.5,
                 })
                 await broadcast(room_code, {"t": "doorlock_all_locked", "msg": "모든 집이 잠깁니다."})
-                asyncio.create_task(ai_do_night_actions(room_code))
+                # 준버그: task 등록
+                t = asyncio.create_task(ai_do_night_actions(room_code))
+                rs.tasks.append(t)
 
             elif phase == "morning":
-                mr = await process_night(room_code, gs, rs)
-                gs["morning_result"] = mr
-                gs = give_morning_bread(gs)
-                await save_gs(room_code, gs)
+                async with get_room_lock(room_code):
+                    mr = await process_night(room_code, gs, rs)
+                    gs["morning_result"] = mr
+                    gs = give_morning_bread(gs)
+                    await _save_gs_cached(room_code, gs)
                 await broadcast(room_code, {
                     "t": "lighting_change", "phase": "morning",
                     "house_lights": False, "plaza_lights": True, "street_lights_energy": 0.4,
@@ -939,7 +1021,8 @@ async def phase_loop(room_code: str):
                 continue
 
             elif phase == "vote":
-                asyncio.create_task(ai_do_vote_actions(room_code))
+                t = asyncio.create_task(ai_do_vote_actions(room_code))
+                rs.tasks.append(t)
             elif phase == "meet":
                 await send_house_hints(room_code, gs)
                 await broadcast(room_code, {
@@ -969,22 +1052,29 @@ async def phase_loop(room_code: str):
                     await broadcast(room_code, {"t": "tick", "time": rem})
 
             if room_code not in rooms: return
-            gs = await load_gs(room_code)
+            async with get_room_lock(room_code):
+                gs = await _load_gs_cached(room_code)
 
             if phase == "vote":
-                elim = await process_votes(room_code, gs)
-                await broadcast(room_code, {
-                    "t": "vote_result", "eliminated": elim,
-                    "alive": gs["alive"], "tie_pool": gs["tie_pool"],
-                })
-                winner = check_win(gs)
-                if winner or gs["day"] >= MAX_ROUNDS:
-                    await end_game(room_code, gs, winner or "citizen", "vote"); return
-                gs["day"] += 1
-                await save_gs(room_code, gs)
+                async with get_room_lock(room_code):
+                    elim = await process_votes(room_code, gs)
+                    await broadcast(room_code, {
+                        "t": "vote_result", "eliminated": elim,
+                        "alive": gs["alive"], "tie_pool": gs["tie_pool"],
+                    })
+                    winner = check_win(gs)
+                    if winner or gs["day"] >= MAX_ROUNDS:
+                        await end_game(room_code, gs, winner or "citizen", "vote"); return
+                    gs["day"] += 1
+                    await _save_gs_cached(room_code, gs)
 
     except asyncio.CancelledError:
         print(f"[Phase] {room_code} 취소", flush=True)
     except Exception as e:
         import traceback
         print(f"[Phase] {room_code} 오류: {e}\n{traceback.format_exc()}", flush=True)
+    finally:
+        # S급: 루프 종료 시 반드시 플래그 해제
+        rs = rooms.get(room_code)
+        if rs:
+            rs.phase_running = False
