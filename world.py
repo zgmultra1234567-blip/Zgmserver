@@ -7,6 +7,7 @@ from config import (
     WORLD_BOUND, HOUSE_HALF, HOUSE_CENTERS,
     PLAYER_MAX_DIST_PER_TICK, MAX_TELEPORT_DIST,
     MOVE_WARN_THRESHOLD, MOVE_WARN_DECAY_SEC,
+    DEBUG,
 )
 from state import rooms
 
@@ -104,5 +105,6 @@ def _record_warning(rs, uid: str, dist: float, label: str):
         warn["count"] = max(0, warn["count"] - 1)
     warn["count"]  += 1
     warn["last_ts"] = now
+    # 반복 의심은 항상 출력 (보안 로그이므로 DEBUG 무관)
     if warn["count"] > MOVE_WARN_THRESHOLD:
         print(f"[MoveHack] {uid} {label} 반복 의심 (dist={dist:.2f}, warn={warn['count']})", flush=True)
