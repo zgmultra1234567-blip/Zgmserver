@@ -4,6 +4,9 @@ config.py — 모든 상수 정의
 """
 import os
 
+# 디버그 모드 (False = print 억제)
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
 # Firebase / Redis
 RTDB_URL    = "https://zgm-base-default-rtdb.asia-southeast1.firebasedatabase.app/"
 RTDB_SECRET = os.environ.get("RTDB_SECRET", "")
